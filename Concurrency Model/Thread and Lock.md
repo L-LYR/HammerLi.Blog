@@ -531,3 +531,128 @@ auto main() -> int {
 }
 ```
 
+## 线程池
+
+资源池是一种资源使用模式，使用场景如下：
+
+- 获取资源的成本较高
+- 请求资源的频率很高且使用资源的总数较低
+- 涉及处理时间延迟等性能问题
+
+常见的如数据库连接池，套接字连接池，线程池，内存池等，这些基本上都需要系统调用或者通过网络进行远程请求来获取。
+
+线程池也是其中之一嘛，我觉得概念知道以下两个就好了。
+
+- 线程池是啥？
+  - 线程池是一组高效执行异步回调的工作线程集合。
+
+- 线程池有啥优点？
+  - 减少程序创建的线程的数量
+  - 辅助线程管理，有效减少上下文切换次数
+  - 后台并行处理多个独立工作
+
+### 正题：造一个简陋的线程池
+
+从Microsoft的[文档](https://docs.microsoft.com/en-us/windows/win32/procthread/thread-pools)中，可以了解到一个完整线程池的组件有如下几个部分：
+
+- Worker，执行回调的工作线程
+- Waiter，等待多个句柄的监听线程
+- Queue，工作队列
+- Pool，一个进程一个默认池
+- Worker Factory，工作线程工厂
+
+这里接下将实现一个简陋的线程池，仅包含：
+
+- 线程安全的工作队列
+- 可以设置回调函数的工作线程
+- 获取工作线程的返回值
+
+上述的功能只使用`C++11`的标准库，源代码仓库[在此](https://github.com/progschj/ThreadPool)。
+
+线程池类型的成员：
+
+```c++
+class ThreadPool {
+  private:
+    std::vector<std::thread> workers; // 工作线程
+    std::queue<std::function<void()>> tasks; // 工作队列
+    std::mutex mutex; // 保护队列和线程池状态的锁
+    std::condition_variable condition; // 用来通知线程工作的条件变量
+    bool terminate; // 线程池状态：启动和关闭
+};
+```
+
+构造函数：
+
+```c++
+ThreadPool(size_t nThread) : terminate(false) {
+    for (size_t i = 0; i < nThread; ++i) {
+        workers.emplace_back(
+            [this] {
+                while (true) {
+                    decltype(tasks)::value_type task;
+                    {
+                        // 等待任务或状态变化
+                        std::unique_lock<std::mutex> lock(this->mutex);
+                        this->condition.wait(lock, [this] {
+                            return this->terminate || !this->tasks.empty();
+                        });
+
+                        if (this->terminate && this->tasks.empty()) {
+                            return;
+                        }
+
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
+                }
+            });
+    }
+}
+```
+
+析构函数：
+
+```c++
+~ThreadPool() {
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        terminate = true; // 关闭
+    }
+    condition.notify_all(); // 提醒全部线程关闭
+    for (auto& worker : workers) worker.join();
+}
+```
+
+添加任务：
+
+```c++
+template <typename F, typename... Args>
+auto addTask(F&& f, Args&&... args) -> std::future<typename std::result_of<F(Args...)>::type> {
+    using return_type = typename std::result_of<F(Args...)>::type;
+
+    auto task = std::make_shared<std::packaged_task<return_type()>>(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+    ); // 包装任务，以使用get_future来获取返回值
+
+    std::future<return_type> res = task->get_future();
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (terminate) throw std::runtime_error("add task to terminated thread pool");
+
+        tasks.emplace([task] { (*task)(); }); // 添加任务
+    }
+
+    condition.notify_one(); // 通知一个等任务的线程
+
+    return res;
+}
+```
+
+
+
+
+
+
+
